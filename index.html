@@ -199,7 +199,7 @@
   <div class="grid" id="details"></div>
 
   <div class="foot">
-    Data: Open‑Meteo · Radar: RainViewer · Alerts: US National Weather Service<br>
+    Forecast: Open‑Meteo · US temps: National Weather Service · Radar: RainViewer<br>
     Add to Home Screen for full‑screen, app‑like use.
   </div>
 </div>
@@ -314,6 +314,72 @@ async function loadWeather(){
   el("locUpd").textContent = "Updated "+new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"});
   loadAlerts();
   centerRadar();
+  patchWithNWS(data);   // US: correct temps to official NWS numbers
+}
+
+/* ---------- NWS temperature correction (US only, best-effort) ----------
+   Open-Meteo runs ~2-3° warm vs NWS in some regions. For US points we
+   overlay the official NWS forecast temps (same source as Weather Channel).
+   Keeps Open-Meteo's codes, details, sun times, UV, days 8-10, and all
+   non-US locations untouched. Silently does nothing if NWS isn't available. */
+async function patchWithNWS(d){
+  try{
+    const nh = {headers:{"Accept":"application/geo+json"}};
+    const pr = await fetch(`https://api.weather.gov/points/${place.lat.toFixed(4)},${place.lon.toFixed(4)}`, nh);
+    if(!pr.ok) return;                       // non-US → 404 → keep Open-Meteo
+    const pj = await pr.json();
+    const hourlyUrl = pj.properties && pj.properties.forecastHourly;
+    const dailyUrl  = pj.properties && pj.properties.forecast;
+    if(!hourlyUrl) return;
+    const [hr, dr] = await Promise.all([ fetch(hourlyUrl, nh), dailyUrl?fetch(dailyUrl, nh):Promise.resolve(null) ]);
+    if(!hr.ok) return;
+    const periods = (await hr.json()).properties.periods;   // hourly, °F
+    const toU = f => unit==="F" ? f : (f-32)*5/9;
+    const epochHr = t => Math.floor(Date.parse(t)/3600000);
+
+    // hourly map
+    const hmap = new Map();
+    periods.forEach(p=>hmap.set(epochHr(p.startTime), {
+      temp:p.temperature,
+      pop:(p.probabilityOfPrecipitation&&p.probabilityOfPrecipitation.value),
+      rh:(p.relativeHumidity&&p.relativeHumidity.value)
+    }));
+
+    // patch hourly array in place
+    for(let i=0;i<d.hourly.time.length;i++){
+      const m=hmap.get(epochHr(d.hourly.time[i]));
+      if(m){ d.hourly.temperature_2m[i]=toU(m.temp); if(m.pop!=null) d.hourly.precipitation_probability[i]=m.pop; }
+    }
+    // patch current
+    const cm = hmap.get(Math.floor(Date.now()/3600000)) || (periods[0] && {temp:periods[0].temperature, rh:(periods[0].relativeHumidity&&periods[0].relativeHumidity.value)});
+    if(cm){
+      const newT=toU(cm.temp);
+      const delta=newT - d.current.temperature_2m;
+      d.current.temperature_2m=newT;
+      d.current.apparent_temperature += delta;           // shift feels-like by same amount
+      if(cm.rh!=null) d.current.relative_humidity_2m=cm.rh;
+    }
+    // patch daily (only where NWS has a full day/night pair, so "Today" high isn't lost in the evening)
+    if(dr && dr.ok){
+      const byDate=new Map();
+      (await dr.json()).properties.periods.forEach(p=>{
+        const date=p.startTime.slice(0,10);
+        const o=byDate.get(date)||{day:null,night:null,pops:[]};
+        if(p.isDaytime) o.day=p.temperature; else o.night=p.temperature;
+        const pop=(p.probabilityOfPrecipitation&&p.probabilityOfPrecipitation.value); if(pop!=null)o.pops.push(pop);
+        byDate.set(date,o);
+      });
+      for(let i=0;i<d.daily.time.length;i++){
+        const o=byDate.get(d.daily.time[i]); if(!o) continue;
+        if(o.day!=null)   d.daily.temperature_2m_max[i]=toU(o.day);
+        if(o.night!=null) d.daily.temperature_2m_min[i]=toU(o.night);
+        if(o.pops.length) d.daily.precipitation_probability_max[i]=Math.max(...o.pops);
+      }
+    }
+    // re-render with corrected numbers
+    renderCurrent(d); renderHourly(d); renderDaily(d); renderDetails(d);
+    el("locUpd").textContent = "Updated "+new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})+" · NWS";
+  }catch(e){ /* keep Open-Meteo values on any error */ }
 }
 
 function renderCurrent(d){
@@ -428,7 +494,7 @@ const RADAR_COLOR=4;   // 4 = The Weather Channel
 const FRAME_MS=480;
 
 function initMap(){
-  map=L.map("map",{zoomControl:true,attributionControl:true,maxZoom:11,minZoom:3}).setView([place.lat,place.lon],7);
+  map=L.map("map",{zoomControl:true,attributionControl:true,maxZoom:12,minZoom:3}).setView([place.lat,place.lon],7);
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{
     subdomains:"abcd", attribution:'&copy; OpenStreetMap &copy; CARTO', maxZoom:19
   }).addTo(map);
@@ -464,7 +530,7 @@ function frameLayer(i){
   if(radarLayers[i]) return radarLayers[i];
   const f=radarFrames[i];
   const url=`${radarHost}${f.path}/256/{z}/{x}/{y}/${RADAR_COLOR}/1_1.png`;
-  const layer=L.tileLayer(url,{opacity:0,maxNativeZoom:8,maxZoom:11,tileSize:256});
+  const layer=L.tileLayer(url,{opacity:0,maxNativeZoom:7,maxZoom:12,tileSize:256});
   layer.addTo(map); radarLayers[i]=layer; return layer;
 }
 function showFrame(i){
